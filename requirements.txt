@@ -1,0 +1,7 @@
+streamlit
+openai-whisper
+moviepy
+reportlab
+imageio-ffmpeg
+torch
+torchaudio
