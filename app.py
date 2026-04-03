@@ -195,46 +195,24 @@ def extract_youtube_video_id(url: str) -> str:
 
     raise ValueError("Could not extract a YouTube video ID from that URL.")
 
-
 def fetch_youtube_captions(youtube_url: str):
     """
-    Fetch YouTube captions and return transcript text plus a reasonable title.
+    Fetch YouTube captions (compatible with Streamlit Cloud version).
     """
     video_id = extract_youtube_video_id(youtube_url)
 
-    transcript_list = YouTubeTranscriptApi.list_transcripts(video_id)
-
-    transcript = None
-
     try:
-        transcript = transcript_list.find_manually_created_transcript(["en"])
+        transcript = YouTubeTranscriptApi.get_transcript(video_id)
     except Exception:
-        pass
+        raise ValueError("No captions available for this video.")
 
-    if transcript is None:
-        try:
-            transcript = transcript_list.find_generated_transcript(["en"])
-        except Exception:
-            pass
-
-    if transcript is None:
-        for item in transcript_list:
-            transcript = item
-            break
-
-    if transcript is None:
-        raise ValueError("No captions were found for this YouTube video.")
-
-    fetched = transcript.fetch()
-    formatter = TextFormatter()
-    transcript_text = formatter.format_transcript(fetched).strip()
+    transcript_text = " ".join([item["text"] for item in transcript]).strip()
 
     if not transcript_text:
-        raise ValueError("Captions were found, but no transcript text was returned.")
+        raise ValueError("Captions were found, but no usable text was returned.")
 
     fallback_title = f"youtube_{video_id}"
     return transcript_text, fallback_title
-
 
 def reset_transcript_state():
     st.session_state.transcript = ""
