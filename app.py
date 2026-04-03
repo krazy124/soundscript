@@ -3,14 +3,16 @@ import os
 import re
 import html
 import tempfile
+from urllib.parse import urlparse, parse_qs
 
 import streamlit as st
 import whisper
-import yt_dlp
 
 from moviepy.video.io.VideoFileClip import VideoFileClip
 from reportlab.lib.pagesizes import letter
 from reportlab.pdfgen import canvas
+from youtube_transcript_api import YouTubeTranscriptApi
+from youtube_transcript_api.formatters import TextFormatter
 
 
 # =========================
@@ -51,41 +53,6 @@ def extract_audio_from_video(video_path: str, output_audio_path: str) -> None:
     finally:
         if clip is not None:
             clip.close()
-
-
-def download_audio_from_youtube(youtube_url: str, output_audio_path: str) -> str:
-    """
-    Download audio from a YouTube URL and convert it to MP3.
-    Returns the video title if available.
-    """
-    output_template = os.path.splitext(output_audio_path)[0] + ".%(ext)s"
-
-    ydl_opts = {
-        "format": "bestaudio/best",
-        "outtmpl": output_template,
-        "noplaylist": True,
-        "quiet": True,
-        "no_warnings": True,
-        "postprocessors": [
-            {
-                "key": "FFmpegExtractAudio",
-                "preferredcodec": "mp3",
-                "preferredquality": "192",
-            }
-        ],
-    }
-
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        info = ydl.extract_info(youtube_url, download=True)
-        title = info.get("title", "youtube_video")
-
-    if not os.path.exists(output_audio_path):
-        raise FileNotFoundError(
-            "Audio download finished, but the MP3 file was not found. "
-            "Make sure FFmpeg is installed and available on your system."
-        )
-
-    return title
 
 
 def make_pdf_bytes(title: str, body_text: str) -> bytes:
@@ -199,6 +166,76 @@ def is_valid_youtube_url(url: str) -> bool:
     return bool(re.match(pattern, url.strip()))
 
 
+def extract_youtube_video_id(url: str) -> str:
+    """
+    Extract the YouTube video ID from common YouTube URL formats.
+    """
+    parsed = urlparse(url)
+
+    if parsed.netloc in ("youtu.be", "www.youtu.be"):
+        video_id = parsed.path.lstrip("/")
+        if video_id:
+            return video_id
+
+    if parsed.netloc in ("youtube.com", "www.youtube.com", "m.youtube.com"):
+        if parsed.path == "/watch":
+            qs = parse_qs(parsed.query)
+            if "v" in qs and qs["v"]:
+                return qs["v"][0]
+
+        if parsed.path.startswith("/shorts/"):
+            parts = parsed.path.split("/")
+            if len(parts) >= 3 and parts[2]:
+                return parts[2]
+
+        if parsed.path.startswith("/embed/"):
+            parts = parsed.path.split("/")
+            if len(parts) >= 3 and parts[2]:
+                return parts[2]
+
+    raise ValueError("Could not extract a YouTube video ID from that URL.")
+
+
+def fetch_youtube_captions(youtube_url: str):
+    """
+    Fetch YouTube captions and return transcript text plus a reasonable title.
+    """
+    video_id = extract_youtube_video_id(youtube_url)
+
+    transcript_list = YouTubeTranscriptApi.list_transcripts(video_id)
+
+    transcript = None
+
+    try:
+        transcript = transcript_list.find_manually_created_transcript(["en"])
+    except Exception:
+        pass
+
+    if transcript is None:
+        try:
+            transcript = transcript_list.find_generated_transcript(["en"])
+        except Exception:
+            pass
+
+    if transcript is None:
+        for item in transcript_list:
+            transcript = item
+            break
+
+    if transcript is None:
+        raise ValueError("No captions were found for this YouTube video.")
+
+    fetched = transcript.fetch()
+    formatter = TextFormatter()
+    transcript_text = formatter.format_transcript(fetched).strip()
+
+    if not transcript_text:
+        raise ValueError("Captions were found, but no transcript text was returned.")
+
+    fallback_title = f"youtube_{video_id}"
+    return transcript_text, fallback_title
+
+
 def reset_transcript_state():
     st.session_state.transcript = ""
     st.session_state.transcription_complete = False
@@ -230,14 +267,14 @@ if "original_name" not in st.session_state:
 # UI
 # =========================
 st.title("Video to Text Transcriber")
-st.write("Upload a video or paste a YouTube link, extract the audio, transcribe it with Whisper, and download the transcript.")
+st.write("Upload a video file for Whisper transcription, or paste a YouTube link to pull captions.")
 
 with st.expander("Settings", expanded=True):
     model_name = st.selectbox(
         "Whisper model",
         options=["tiny", "base", "small", "medium", "large"],
         index=1,
-        help="Smaller models are faster. Larger models may be more accurate."
+        help="Used for uploaded video files. Smaller models are faster. Larger models may be more accurate."
     )
 
 input_mode = st.radio(
@@ -245,8 +282,6 @@ input_mode = st.radio(
     options=["Upload Video File", "YouTube Link"],
     horizontal=True
 )
-
-transcribe_clicked = False
 
 if input_mode == "Upload Video File":
     uploaded_file = st.file_uploader(
@@ -256,76 +291,26 @@ if input_mode == "Upload Video File":
 
     if uploaded_file is not None:
         st.video(uploaded_file)
-        transcribe_clicked = st.button("Transcribe video")
-    else:
-        st.info("Upload a video file to get started.")
 
-    if transcribe_clicked:
-        reset_transcript_state()
+        if st.button("Transcribe video"):
+            reset_transcript_state()
 
-        original_name = os.path.splitext(uploaded_file.name)[0]
-        file_base = safe_filename(original_name)
+            original_name = os.path.splitext(uploaded_file.name)[0]
+            file_base = safe_filename(original_name)
 
-        with st.spinner("Loading Whisper model..."):
-            model = load_whisper_model(model_name)
-
-        with tempfile.TemporaryDirectory() as temp_dir:
-            video_path = os.path.join(temp_dir, uploaded_file.name)
-            audio_path = os.path.join(temp_dir, f"{file_base}.mp3")
-
-            with open(video_path, "wb") as f:
-                f.write(uploaded_file.getbuffer())
-
-            try:
-                with st.spinner("Extracting audio from video..."):
-                    extract_audio_from_video(video_path, audio_path)
-
-                with st.spinner("Transcribing audio..."):
-                    result = model.transcribe(audio_path)
-                    transcript = result.get("text", "").strip()
-
-                if not transcript:
-                    st.warning("No transcript text was produced.")
-                else:
-                    st.success("Transcription complete.")
-                    st.session_state.transcript = transcript
-                    st.session_state.transcription_complete = True
-                    st.session_state.source_label = "Uploaded video"
-                    st.session_state.file_base = file_base
-                    st.session_state.original_name = original_name
-
-            except Exception as e:
-                st.error(f"Something went wrong: {e}")
-
-elif input_mode == "YouTube Link":
-    youtube_url = st.text_input(
-        "Paste a YouTube URL",
-        placeholder="https://www.youtube.com/watch?v=..."
-    )
-
-    transcribe_clicked = st.button("Transcribe YouTube video")
-
-    if transcribe_clicked:
-        reset_transcript_state()
-
-        if not youtube_url.strip():
-            st.warning("Please paste a YouTube URL.")
-        elif not is_valid_youtube_url(youtube_url):
-            st.warning("That does not look like a valid YouTube URL.")
-        else:
             with st.spinner("Loading Whisper model..."):
                 model = load_whisper_model(model_name)
 
             with tempfile.TemporaryDirectory() as temp_dir:
-                temp_audio_base = "youtube_audio"
-                audio_path = os.path.join(temp_dir, f"{temp_audio_base}.mp3")
+                video_path = os.path.join(temp_dir, uploaded_file.name)
+                audio_path = os.path.join(temp_dir, f"{file_base}.mp3")
+
+                with open(video_path, "wb") as f:
+                    f.write(uploaded_file.getbuffer())
 
                 try:
-                    with st.spinner("Downloading audio from YouTube..."):
-                        video_title = download_audio_from_youtube(youtube_url, audio_path)
-
-                    original_name = video_title
-                    file_base = safe_filename(video_title)
+                    with st.spinner("Extracting audio from video..."):
+                        extract_audio_from_video(video_path, audio_path)
 
                     with st.spinner("Transcribing audio..."):
                         result = model.transcribe(audio_path)
@@ -337,12 +322,43 @@ elif input_mode == "YouTube Link":
                         st.success("Transcription complete.")
                         st.session_state.transcript = transcript
                         st.session_state.transcription_complete = True
-                        st.session_state.source_label = "YouTube video"
+                        st.session_state.source_label = "Uploaded video"
                         st.session_state.file_base = file_base
                         st.session_state.original_name = original_name
 
                 except Exception as e:
                     st.error(f"Something went wrong: {e}")
+    else:
+        st.info("Upload a video file to get started.")
+
+elif input_mode == "YouTube Link":
+    youtube_url = st.text_input(
+        "Paste a YouTube URL",
+        placeholder="https://www.youtube.com/watch?v=..."
+    )
+
+    if st.button("Get YouTube captions"):
+        reset_transcript_state()
+
+        if not youtube_url.strip():
+            st.warning("Please paste a YouTube URL.")
+        elif not is_valid_youtube_url(youtube_url):
+            st.warning("That does not look like a valid YouTube URL.")
+        else:
+            try:
+                with st.spinner("Fetching YouTube captions..."):
+                    transcript_text, fallback_title = fetch_youtube_captions(youtube_url)
+
+                st.success("Captions loaded.")
+                st.session_state.transcript = transcript_text
+                st.session_state.transcription_complete = True
+                st.session_state.source_label = "YouTube captions"
+                st.session_state.file_base = safe_filename(fallback_title)
+                st.session_state.original_name = fallback_title
+
+            except Exception as e:
+                st.error(f"Something went wrong: {e}")
+
 
 # =========================
 # TRANSCRIPT OUTPUT
