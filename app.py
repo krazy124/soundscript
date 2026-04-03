@@ -1,10 +1,12 @@
 import io
 import os
+import re
 import html
 import tempfile
 
 import streamlit as st
 import whisper
+import yt_dlp
 
 from moviepy.video.io.VideoFileClip import VideoFileClip
 from reportlab.lib.pagesizes import letter
@@ -33,7 +35,7 @@ def load_whisper_model(model_name: str):
 
 def extract_audio_from_video(video_path: str, output_audio_path: str) -> None:
     """
-    Extract audio from a video file and save it as MP3.
+    Extract audio from a local video file and save it as MP3.
     """
     clip = None
     try:
@@ -49,6 +51,41 @@ def extract_audio_from_video(video_path: str, output_audio_path: str) -> None:
     finally:
         if clip is not None:
             clip.close()
+
+
+def download_audio_from_youtube(youtube_url: str, output_audio_path: str) -> str:
+    """
+    Download audio from a YouTube URL and convert it to MP3.
+    Returns the video title if available.
+    """
+    output_template = os.path.splitext(output_audio_path)[0] + ".%(ext)s"
+
+    ydl_opts = {
+        "format": "bestaudio/best",
+        "outtmpl": output_template,
+        "noplaylist": True,
+        "quiet": True,
+        "no_warnings": True,
+        "postprocessors": [
+            {
+                "key": "FFmpegExtractAudio",
+                "preferredcodec": "mp3",
+                "preferredquality": "192",
+            }
+        ],
+    }
+
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        info = ydl.extract_info(youtube_url, download=True)
+        title = info.get("title", "youtube_video")
+
+    if not os.path.exists(output_audio_path):
+        raise FileNotFoundError(
+            "Audio download finished, but the MP3 file was not found. "
+            "Make sure FFmpeg is installed and available on your system."
+        )
+
+    return title
 
 
 def make_pdf_bytes(title: str, body_text: str) -> bytes:
@@ -82,7 +119,6 @@ def make_pdf_bytes(title: str, body_text: str) -> bytes:
                 y = top_margin
             continue
 
-        # Wrap long lines manually
         words = paragraph.split()
         current_line = ""
 
@@ -155,11 +191,46 @@ def copy_to_clipboard_html(text: str):
     st.components.v1.html(button_html, height=55)
 
 
+def is_valid_youtube_url(url: str) -> bool:
+    """
+    Basic YouTube URL validation.
+    """
+    pattern = r"(https?://)?(www\.)?(youtube\.com|youtu\.be)/.+"
+    return bool(re.match(pattern, url.strip()))
+
+
+def reset_transcript_state():
+    st.session_state.transcript = ""
+    st.session_state.transcription_complete = False
+    st.session_state.source_label = ""
+    st.session_state.file_base = "transcript"
+    st.session_state.original_name = "Transcript"
+
+
+# =========================
+# SESSION STATE
+# =========================
+if "transcript" not in st.session_state:
+    st.session_state.transcript = ""
+
+if "transcription_complete" not in st.session_state:
+    st.session_state.transcription_complete = False
+
+if "source_label" not in st.session_state:
+    st.session_state.source_label = ""
+
+if "file_base" not in st.session_state:
+    st.session_state.file_base = "transcript"
+
+if "original_name" not in st.session_state:
+    st.session_state.original_name = "Transcript"
+
+
 # =========================
 # UI
 # =========================
 st.title("Video to Text Transcriber")
-st.write("Upload a video, extract the audio, transcribe it with Whisper, and download the transcript.")
+st.write("Upload a video or paste a YouTube link, extract the audio, transcribe it with Whisper, and download the transcript.")
 
 with st.expander("Settings", expanded=True):
     model_name = st.selectbox(
@@ -169,18 +240,32 @@ with st.expander("Settings", expanded=True):
         help="Smaller models are faster. Larger models may be more accurate."
     )
 
-uploaded_file = st.file_uploader(
-    "Upload a video file",
-    type=["mp4", "mov", "avi", "mkv", "mpeg", "mpg", "webm", "m4v"]
+input_mode = st.radio(
+    "Choose input source",
+    options=["Upload Video File", "YouTube Link"],
+    horizontal=True
 )
 
-if uploaded_file is not None:
-    st.video(uploaded_file)
+transcribe_clicked = False
 
-    original_name = os.path.splitext(uploaded_file.name)[0]
-    file_base = safe_filename(original_name)
+if input_mode == "Upload Video File":
+    uploaded_file = st.file_uploader(
+        "Upload a video file",
+        type=["mp4", "mov", "avi", "mkv", "mpeg", "mpg", "webm", "m4v"]
+    )
 
-    if st.button("Transcribe video"):
+    if uploaded_file is not None:
+        st.video(uploaded_file)
+        transcribe_clicked = st.button("Transcribe video")
+    else:
+        st.info("Upload a video file to get started.")
+
+    if transcribe_clicked:
+        reset_transcript_state()
+
+        original_name = os.path.splitext(uploaded_file.name)[0]
+        file_base = safe_filename(original_name)
+
         with st.spinner("Loading Whisper model..."):
             model = load_whisper_model(model_name)
 
@@ -188,7 +273,6 @@ if uploaded_file is not None:
             video_path = os.path.join(temp_dir, uploaded_file.name)
             audio_path = os.path.join(temp_dir, f"{file_base}.mp3")
 
-            # Save uploaded video to disk
             with open(video_path, "wb") as f:
                 f.write(uploaded_file.getbuffer())
 
@@ -204,41 +288,99 @@ if uploaded_file is not None:
                     st.warning("No transcript text was produced.")
                 else:
                     st.success("Transcription complete.")
-
-                    st.subheader("Transcript")
-                    st.text_area(
-                        "Editable transcript",
-                        value=transcript,
-                        height=400
-                    )
-
-                    copy_to_clipboard_html(transcript)
-
-                    txt_bytes = transcript.encode("utf-8")
-                    pdf_bytes = make_pdf_bytes(
-                        title=f"Transcript - {original_name}",
-                        body_text=transcript
-                    )
-
-                    col1, col2 = st.columns(2)
-
-                    with col1:
-                        st.download_button(
-                            label="Download as TXT",
-                            data=txt_bytes,
-                            file_name=f"{file_base}_transcript.txt",
-                            mime="text/plain"
-                        )
-
-                    with col2:
-                        st.download_button(
-                            label="Download as PDF",
-                            data=pdf_bytes,
-                            file_name=f"{file_base}_transcript.pdf",
-                            mime="application/pdf"
-                        )
+                    st.session_state.transcript = transcript
+                    st.session_state.transcription_complete = True
+                    st.session_state.source_label = "Uploaded video"
+                    st.session_state.file_base = file_base
+                    st.session_state.original_name = original_name
 
             except Exception as e:
                 st.error(f"Something went wrong: {e}")
-else:
-    st.info("Upload a video file to get started.")
+
+elif input_mode == "YouTube Link":
+    youtube_url = st.text_input(
+        "Paste a YouTube URL",
+        placeholder="https://www.youtube.com/watch?v=..."
+    )
+
+    transcribe_clicked = st.button("Transcribe YouTube video")
+
+    if transcribe_clicked:
+        reset_transcript_state()
+
+        if not youtube_url.strip():
+            st.warning("Please paste a YouTube URL.")
+        elif not is_valid_youtube_url(youtube_url):
+            st.warning("That does not look like a valid YouTube URL.")
+        else:
+            with st.spinner("Loading Whisper model..."):
+                model = load_whisper_model(model_name)
+
+            with tempfile.TemporaryDirectory() as temp_dir:
+                temp_audio_base = "youtube_audio"
+                audio_path = os.path.join(temp_dir, f"{temp_audio_base}.mp3")
+
+                try:
+                    with st.spinner("Downloading audio from YouTube..."):
+                        video_title = download_audio_from_youtube(youtube_url, audio_path)
+
+                    original_name = video_title
+                    file_base = safe_filename(video_title)
+
+                    with st.spinner("Transcribing audio..."):
+                        result = model.transcribe(audio_path)
+                        transcript = result.get("text", "").strip()
+
+                    if not transcript:
+                        st.warning("No transcript text was produced.")
+                    else:
+                        st.success("Transcription complete.")
+                        st.session_state.transcript = transcript
+                        st.session_state.transcription_complete = True
+                        st.session_state.source_label = "YouTube video"
+                        st.session_state.file_base = file_base
+                        st.session_state.original_name = original_name
+
+                except Exception as e:
+                    st.error(f"Something went wrong: {e}")
+
+# =========================
+# TRANSCRIPT OUTPUT
+# =========================
+if st.session_state.transcription_complete and st.session_state.transcript:
+    st.subheader("Transcript")
+    st.caption(f"Source: {st.session_state.source_label}")
+
+    edited_transcript = st.text_area(
+        "Editable transcript",
+        value=st.session_state.transcript,
+        height=400
+    )
+
+    st.session_state.transcript = edited_transcript
+
+    copy_to_clipboard_html(st.session_state.transcript)
+
+    txt_bytes = st.session_state.transcript.encode("utf-8")
+    pdf_bytes = make_pdf_bytes(
+        title=f"Transcript - {st.session_state.original_name}",
+        body_text=st.session_state.transcript
+    )
+
+    col1, col2 = st.columns(2)
+
+    with col1:
+        st.download_button(
+            label="Download as TXT",
+            data=txt_bytes,
+            file_name=f"{st.session_state.file_base}_transcript.txt",
+            mime="text/plain"
+        )
+
+    with col2:
+        st.download_button(
+            label="Download as PDF",
+            data=pdf_bytes,
+            file_name=f"{st.session_state.file_base}_transcript.pdf",
+            mime="application/pdf"
+        )
